@@ -23,8 +23,9 @@ class ModelsDiagram < AppDiagram
         process_class extract_class_name(f).constantize
       rescue Exception
         STDERR.puts "Warning: exception #{$!} raised while trying to load model class #{f}"
+        STDERR.puts "         #{$!.backtrace.first}"
       end
-      
+
     end
   end
 
@@ -46,7 +47,7 @@ class ModelsDiagram < AppDiagram
     filename.match(/.*\/models\/(.*).rb$/)[1].camelize
   end
 
-  
+
   # Process a model class
   def process_class(current_class)
     STDERR.puts "Processing #{current_class}" if @options.verbose
@@ -58,6 +59,8 @@ class ModelsDiagram < AppDiagram
         process_mongoid_model(current_class)
       elsif defined?(DataMapper::Resource) && current_class.new.is_a?(DataMapper::Resource)
         process_datamapper_model(current_class)
+      elsif defined?(Sequel::Model) && current_class.new.is_a?(Sequel::Model)
+        process_sequel_model(current_class)
       elsif current_class.respond_to?'reflect_on_all_associations'
         process_active_record_model(current_class)
       elsif @options.all && (current_class.is_a? Class)
@@ -134,6 +137,57 @@ class ModelsDiagram < AppDiagram
 
     associations.each do |a|
       process_association current_class.name, a
+    end
+
+    true
+  end
+
+  def process_sequel_model(current_class)
+    node_attribs = []
+    if @options.brief
+      node_type = 'model-brief'
+    else
+      node_type = 'model'
+
+      # Collect model's content columns
+      #content_columns = current_class.content_columns
+
+      if @options.hide_magic
+        # From patch #13351
+        # http://wiki.rubyonrails.org/rails/pages/MagicFieldNames
+        magic_fields = [
+          "created_at", "created_on", "updated_at", "updated_on",
+          "lock_version", "type", "id", "position", "parent_id", "lft",
+          "rgt", "quote", "template"
+        ]
+        magic_fields << current_class.table_name + "_count" if current_class.respond_to? 'table_name'
+        content_columns = current_class.columns.select {|c| ! magic_fields.include? c.to_s}
+      else
+        content_columns = current_class.columns
+      end
+
+      content_columns.each do |a|
+        col = current_class.db_schema[a]
+        content_column = a.to_s
+        content_column += ' :' + col[:type].to_s unless @options.hide_types
+        node_attribs << content_column
+      end
+    end
+    @graph.add_node [node_type, current_class.name, node_attribs]
+
+    # Process class associations
+    associations = current_class.association_reflections
+
+    #if @options.inheritance && ! @options.transitive
+    #  superclass_associations = current_class.superclass.associations
+
+    #  associations = associations.select{|a| ! superclass_associations.include? a}
+    #  # This doesn't works!
+    #  # associations -= current_class.superclass.reflect_on_all_associations
+    #end
+
+    associations.each do |name, a|
+      process_sequel_association current_class.name, a
     end
 
     true
@@ -311,6 +365,58 @@ class ModelsDiagram < AppDiagram
     @graph.add_edge [assoc_type, class_name, assoc_class_name, assoc_name]
   end # process_association
 
+  # Process a model association
+  def process_sequel_association(class_name, assoc)
+    STDERR.puts "- Processing model association #{assoc.name.to_s}" if @options.verbose
+
+    # Skip "belongs_to" associations
+    # useless in Sequel
+    macro = assoc[:type].to_s
+    #return if %w[belongs_to referenced_in].include?(macro) && !@options.show_belongs_to
+
+    # Skip "through" associations
+    # TODO ???
+    #through = assoc.options.include?(:through)
+    #return if through && @options.hide_through
+
+    #TODO:
+    # FAIL: assoc.methods.include?(:class_name)
+    # FAIL: assoc.responds_to?(:class_name)
+    assoc_class_name = assoc[:class_name] rescue nil
+    assoc_class_name ||= assoc[:name].to_s.underscore.singularize.camelize
+
+    # Only non standard association names needs a label
+
+    # from patch #12384
+    # if assoc.class_name == assoc.name.to_s.singularize.camelize
+    if assoc_class_name == assoc[:name].to_s.singularize.camelize
+      assoc_name = ''
+    else
+      assoc_name = assoc[:name].to_s
+    end
+
+    # Patch from "alpack" to support classes in a non-root module namespace. See: http://disq.us/yxl1v
+    if class_name.include?("::") && !assoc_class_name.include?("::")
+      assoc_class_name = class_name.split("::")[0..-2].push(assoc_class_name).join("::")
+    end
+    assoc_class_name.gsub!(%r{^::}, '')
+
+    if %w[one_to_one, one_through_one].include?(macro)
+      assoc_type = 'one-one'
+    elsif #macro == 'one_to_many' && (!assoc.options[:through]) ||
+          %w[one_to_many].include?(macro)
+      assoc_type = 'one-many'
+    else # habtm or has_many, :through
+      # Add FAKE associations too in order to understand mistakes
+      return if @habtm.include? [assoc_class_name, class_name, assoc_name]
+      assoc_type = 'many-many'
+      @habtm << [class_name, assoc_class_name, assoc_name]
+    end
+    # from patch #12384
+    # @graph.add_edge [assoc_type, class_name, assoc.class_name, assoc_name]
+    @graph.add_edge [assoc_type, class_name, assoc_class_name, assoc_name]
+  end # process_association
+
   # Process a DataMapper relationship
   def process_datamapper_relationship(class_name, relation)
     STDERR.puts "- Processing DataMapper model relationship #{relation.name.to_s}" if @options.verbose
@@ -348,5 +454,3 @@ class ModelsDiagram < AppDiagram
   end
 
 end # class ModelsDiagram
-
-
